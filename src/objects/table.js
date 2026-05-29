@@ -69,11 +69,20 @@ const refColsSql = await readFile(dirJoin(import.meta.url,'../sql/table-referenc
  */
 
 /**
+ * @typedef {Object} partition
+ * @property {string} key -- ключ секционирования состоящий из стратегии (List, Range, Hash)
+ *      и столбцов и/или выражений:
+ *          LIST (budget_cycle_id) или
+ *          RANGE (col1, TRIM(BOTH FROM col2), COALESCE(col3, (0)::bigint))
+ */
+
+/**
  * Table object
  * @typedef TableDboType
  * @type {Object}
  * @property {string} tablename - наименование
  * @property {string} schema - схема бд
+ * @property {partition} partition - схема партицирования
  * @property {string} comment - описание
  * @property {Array<column>} cols - колонки
  * @property {Array<constraint>} cons - ограничения
@@ -87,18 +96,23 @@ const refColsSql = await readFile(dirJoin(import.meta.url,'../sql/table-referenc
  * @property {string} columns - колонка таблицы - внешний ключ
  * @property {string} r_schema - схема таблицы, на которую ссылка
  * @property {string} r_tablename - имя таблицы
- * @property {string} r_columnname - поле - первичный ключ, на котороее ссылается column
+ * @property {string} r_columnname - поле - первичный ключ, на которое ссылается column
  * @property {Array<string>} unique_cols - список колонок - уникальный ключей таблицы, на которую ссылка
  */
 
 /**
  *
  * @param {TableDboType} table
+ * @param {string} columnsScript
  * @returns {string}
  */
-function addTable(table) {
+function addTable(table, columnsScript = null) {
     let script = '';
-    script += `create table  ${table.schema}.${table.tablename} ();`;
+    script += `create table ${table.schema}.${table.tablename} (${columnsScript ?? ''})`;
+    if (table.partition){
+        script += ` partition by ${table.partition.key}`;
+    }
+    script += ';';
     if (table.comment) {
         script += `comment on table ${table.schema}.${table.tablename} is '${table.comment}';`;
     }
@@ -127,19 +141,24 @@ function updTable(tableNew, tableOld) {
 /**
  * Генерация скрипта создания колонки таблицы
  * @param {column} column - колонка таблицы
+ * @param {boolean} [createTableMode = false] - при создании таблицы нужно создавать колонки сразу, не через alter table add column
  * @returns addColumnReturn
  */
-function addColumn(column) {
+function addColumn(column, createTableMode = false) {
     const script = {};
     // eslint-disable-next-line max-len
-    script.main = `alter table ${column.tableName} add column ${column.name} ${column.datatype}${((column.datatype_length) ? `(${column.datatype_length})` : '')}`;
+    if (createTableMode) {
+        script.main = `${column.name} ${column.datatype}${((column.datatype_length) ? `(${column.datatype_length})` : '')}`;
+    } else {
+        script.main = `alter table ${column.tableName} add column ${column.name} ${column.datatype}${((column.datatype_length) ? `(${column.datatype_length})` : '')}`;
+    }
     if (column.default_value) script.main += ` default ${column.default_value}`;
     if (column.required) script.setNotNull = `alter table ${column.tableName} alter column ${column.name} set not null;`;
     if ('identity' in column && !isEmpty(column.identity)) {
         const _identity = (column.identity === 'a') ? 'always' : 'by default';
         script.main += ` generated ${_identity} as identity`;
     }
-    script.main += ';';
+    if (!createTableMode) script.main += ';';
     if (column.comment) {
         script.comment = `comment on column ${column.tableName}.${column.name} is '${column.comment}';`;
     }
@@ -409,19 +428,38 @@ class DboTable extends Dbo {
             if (script && script !== '') res[part].push(script);
         }
 
-        // таблица создаётся
-        if (!oldObj.tablename) {
-            log(addTable(newObj, true));
-        } else { // изменяется
-            log(updTable(newObj, oldObj));
-        }
         [...(newObj.cols || []), ...(newObj.cons || []), ...(newObj.indx || [])].forEach((c) => { c.tableName = newObj.tableName; });
         [...(oldObj.cols || []), ...(oldObj.cons || []), ...(oldObj.indx || [])].forEach((c) => { c.tableName = oldObj.tableName; });
         // колонки
         const cols = getNames(newObj.cols, 'name');
         const colsOld = getNames(oldObj.cols, 'name');
+        let columnsToAdd = arrStrOps(cols, colsOld, 'except');
+
+        // таблица создаётся
+        if (!oldObj.tablename) {
+            //сначала генерируем скрипт для колонок
+            let columnsScript = { main: [], end: []};
+            columnsToAdd.forEach((colName) => {
+                const col = getByName(newObj.cols, 'name', colName);
+                const s = addColumn(col, true);
+
+                columnsScript.main.push(s.main);
+                if (s.setNotNull) columnsScript.end.push(s.setNotNull);
+                if (s.comment) columnsScript.end.push(s.comment);
+            });
+
+            log(addTable(newObj, columnsScript.main.join(', ')));
+            for (const cScript of columnsScript.end){
+                log(cScript, 'end');
+            }
+
+            columnsToAdd = [];
+        } else { // изменяется
+            log(updTable(newObj, oldObj));
+        }
+
         // новые колонки
-        arrStrOps(cols, colsOld, 'except').forEach((colName) => {
+        columnsToAdd.forEach((colName) => {
             const col = getByName(newObj.cols, 'name', colName);
             const s = addColumn(col);
             log(s.main);
